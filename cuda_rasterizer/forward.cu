@@ -70,15 +70,18 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	return glm::max(result, 0.0f);
 }
 
-// Forward version of 2D covariance matrix computation
+// Forward version of 2D covariance matrix computation 计算二维协方差矩阵 
 __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
 {
 	// The following models the steps outlined by equations 29
 	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
 	// Additionally considers aspect / scaling of viewport.
 	// Transposes used to account for row-/column-major conventions.
+	
+	// 把高斯椭球的均值从世界坐标系转换到相机坐标系 
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
+	// 限制高斯椭球的均值在相机坐标系中的范围 x<=1.3z*tan(fovx), y<=1.3z*tan(fovy)
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
 	const float txtz = t.x / t.z;
@@ -86,11 +89,13 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 
+	// 构建雅克比矩阵J 
 	glm::mat3 J = glm::mat3(
 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
 		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
+	// 构建矩阵W 
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
@@ -98,23 +103,25 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 
 	glm::mat3 T = W * J;
 
+	// 用对称性恢复三维协方差矩阵 
 	glm::mat3 Vrk = glm::mat3(
 		cov3D[0], cov3D[1], cov3D[2],
 		cov3D[1], cov3D[3], cov3D[4],
 		cov3D[2], cov3D[4], cov3D[5]);
 
+	// 计算二维协方差矩阵 现在还是三维等下取前2行和前2列就行
 	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
 
 	// Apply low-pass filter: every Gaussian should be at least
 	// one pixel wide/high. Discard 3rd row and column.
 	cov[0][0] += 0.3f;
-	cov[1][1] += 0.3f;
+	cov[1][1] += 0.3f; // 保证协方差矩阵的对角线元素不要太小 
 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
 }
 
 // Forward method for converting scale and rotation properties of each
 // Gaussian to a 3D covariance matrix in world space. Also takes care
-// of quaternion normalization.
+// of quaternion normalization. 计算三维协方差矩阵 
 __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
 {
 	// Create scaling matrix
@@ -185,59 +192,62 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
-	radii[idx] = 0;
-	tiles_touched[idx] = 0;
+	radii[idx] = 0; // 半径 
+	tiles_touched[idx] = 0; // 是否接触图块 
 
-	// Perform near culling, quit if outside.
+	// Perform near culling, quit if outside. 判断当前点在不在视锥以内
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 
 	// Transform point by projecting
-	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
-	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] }; // 拿到idx对应的原始点坐标 
+	float4 p_hom = transformPoint4x4(p_orig, projmatrix); // 投影变换 这里应该也包含了视角变换
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w }; // 同除以齐次w 归一化投影坐标 
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
-	// from scaling and rotation parameters. 
+	// from scaling and rotation parameters. 计算三维协方差矩阵 
 	const float* cov3D;
-	if (cov3D_precomp != nullptr)
+	if (cov3D_precomp != nullptr) // 之前算过直接提取 
 	{
 		cov3D = cov3D_precomp + idx * 6;
 	}
-	else
+	else // 没算过就计算 再放到全部椭球的cov3Ds中 
 	{
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
 
-	// Compute 2D screen-space covariance matrix
+	// Compute 2D screen-space covariance matrix 计算二维协方差矩阵 
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
-	// Invert covariance (EWA algorithm)
-	float det = (cov.x * cov.z - cov.y * cov.y);
-	if (det == 0.0f)
+	// Invert covariance (EWA algorithm) 计算协方差矩阵的逆 
+	float det = (cov.x * cov.z - cov.y * cov.y); // 计算cov的行列式 
+	if (det == 0.0f) // 行列式为0 不进行后续计算 
 		return;
 	float det_inv = 1.f / det;
-	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv }; // 按公式组合 
 
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
 	// rectangle covers 0 tiles. 
+	// 计算二维高斯分布椭圆的半径 
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	// 把均值从NDC坐标系转到像素坐标系 
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
-	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	getRect(point_image, my_radius, rect_min, rect_max, grid); // 获得当前椭球的外接矩形尺寸
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
+	// 计算当前椭球的颜色 用球谐函数
 	if (colors_precomp == nullptr)
 	{
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
@@ -247,12 +257,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	// Store some useful helper data for the next steps.
-	depths[idx] = p_view.z;
-	radii[idx] = my_radius;
-	points_xy_image[idx] = point_image;
+	depths[idx] = p_view.z; // 当前椭球的深度 用它在相机坐标系中的z坐标 
+	radii[idx] = my_radius; // 二维高斯椭球的半径 
+	points_xy_image[idx] = point_image; // 二维高斯椭球的中心坐标 
 	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] }; // 逆二维协方差矩阵 + 不透明度 
+	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x); // 该高斯椭球是否触及图块 触及>0 不触及=0
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -261,25 +271,25 @@ __global__ void preprocessCUDA(int P, int D, int M,
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
-	const uint2* __restrict__ ranges,
+	const uint2* __restrict__ ranges, // 保存所有block中点的范围 
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
-	const float2* __restrict__ points_xy_image,
-	const float* __restrict__ features,
-	const float4* __restrict__ conic_opacity,
-	float* __restrict__ final_T,
-	uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	const float2* __restrict__ points_xy_image, // 所有二维高斯椭球的中心坐标 有P个元素 
+	const float* __restrict__ features, // 所有高斯椭球的颜色 有3*P个元素 
+	const float4* __restrict__ conic_opacity, // 所有高斯椭球的Cov2D的逆矩阵和不透明度 有P个元素 
+	float* __restrict__ final_T, // 每个pixel上最终的T值 有W*H个元素 
+	uint32_t* __restrict__ n_contrib, // 每个pixel上有贡献的高斯椭球数量 有W*H个元素 
+	const float* __restrict__ bg_color, // 背景颜色 有3个元素 分别表示对RGB三通道的背景色
+	float* __restrict__ out_color) // 输出颜色 一维数组 按行优先排列的 有3*W*H个元素 
 {
-	// Identify current tile and associated min/max pixel range.
+	// Identify current tile and associated min/max pixel range. 根据block和thread找到当前thread处理的pixel 
 	auto block = cg::this_thread_block();
-	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	uint32_t pix_id = W * pix.y + pix.x;
-	float2 pixf = { (float)pix.x, (float)pix.y };
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X; // 水平方向blocks的数量 向上取整 
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y }; // block的左上角x,y坐标
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) }; // block的右下角x,y坐标 用W,H限制越界
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y }; // 当前thread处理的像素x,y坐标 
+	uint32_t pix_id = W * pix.y + pix.x; // 当前pixel的ID 还是x为横轴 y为纵轴
+	float2 pixf = { (float)pix.x, (float)pix.y }; // 转float 
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -287,20 +297,20 @@ renderCUDA(
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x]; // 找到当前block的索引 根据它提取对应的range
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
 
 	// Allocate storage for batches of collectively fetched data.
-	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ int collected_id[BLOCK_SIZE]; // 存id 
+	__shared__ float2 collected_xy[BLOCK_SIZE]; // 存xy坐标 
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE]; // 存cov2D的逆矩阵和不透明度 
 
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
-	float C[CHANNELS] = { 0 };
+	float C[CHANNELS] = { 0 }; // 存当前pixel的RGB颜色 
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -329,9 +339,10 @@ renderCUDA(
 
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
-			float2 xy = collected_xy[j];
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
+			float2 xy = collected_xy[j]; // 当前椭球的中心xy坐标 
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y }; // 计算当前椭球中心和当前pixel的距离 
+			float4 con_o = collected_conic_opacity[j]; // 当前椭球的逆二维协方差矩阵和不透明度 
+			// 用cov2D的逆矩阵的值和d计算power 
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
@@ -340,21 +351,22 @@ renderCUDA(
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
+			// 遵循指数衰减 从二维高斯椭球中心的不透明度opacity 结合exp(power) 计算得到pixel位置的alpha 
+			float alpha = min(0.99f, con_o.w * exp(power)); // 用opacity和power计算alpha 
 			if (alpha < 1.0f / 255.0f)
-				continue;
-			float test_T = T * (1 - alpha);
+				continue; // alpha不能小于1/255 太小说明透明地没了 不能渲染 
+			float test_T = T * (1 - alpha); // 用1-alpha来衰减T 
 			if (test_T < 0.0001f)
 			{
 				done = true;
-				continue;
+				continue; // T被衰减到特别小了 说明当前像素的颜色已经够了 不需要再找椭球了 
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T; // 先根据id找到j这个椭球的颜色 然后和alpha和T一起计算颜色 
 
-			T = test_T;
+			T = test_T; // 更新T 
 
 			// Keep track of last range entry to update this
 			// pixel.
@@ -366,10 +378,10 @@ renderCUDA(
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
 	{
-		final_T[pix_id] = T;
-		n_contrib[pix_id] = last_contributor;
+		final_T[pix_id] = T; // 记录当前pixel在抛雪球后的T值 
+		n_contrib[pix_id] = last_contributor; // 记录当前pixel上一共被抛了多少个雪球 
 		for (int ch = 0; ch < CHANNELS; ch++)
-			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch]; // 添加背景颜色到每个pixel上
 	}
 }
 

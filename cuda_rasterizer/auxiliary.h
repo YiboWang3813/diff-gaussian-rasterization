@@ -40,11 +40,13 @@ __device__ const float SH_C3[] = {
 
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
+	// v的范围是[-1, 1] 
 	return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
+	// 获得当前高斯椭球的外接矩形尺寸
 	rect_min = {
 		min(grid.x, max((int)0, (int)((p.x - max_radius) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y - max_radius) / BLOCK_Y)))
@@ -57,6 +59,7 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {
+	// matrix (4x4) @ p (4x1) p是[x, y, z, 1]^T这种向量 
 	float3 transformed = {
 		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z + matrix[12],
 		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z + matrix[13],
@@ -143,12 +146,15 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	bool prefiltered,
 	float3& p_view)
 {
+	// orig_points保存的是所有高斯椭球的原始点坐标 [x0, y0, z0, x1, y1, z1, ..., xn, yn, zn]
+	// 3 * idx = xn 3 * idx + 1 = yn 3 * idx + 2 = zn 
+	// 这句相当于找到idx这个线程对应的点坐标 
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 
 	// Bring points to screen space
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w }; // 这3行没用 在转p_hom为齐次表达形式
 	p_view = transformPoint4x3(p_orig, viewmatrix);
 
 	if (p_view.z <= 0.2f)// || ((p_proj.x < -1.3 || p_proj.x > 1.3 || p_proj.y < -1.3 || p_proj.y > 1.3)))
@@ -158,7 +164,7 @@ __forceinline__ __device__ bool in_frustum(int idx,
 			printf("Point is filtered although prefiltered is set. This shouldn't happen!");
 			__trap();
 		}
-		return false;
+		return false; // p_view的z坐标太小说明当前点不在视椎以内 
 	}
 	return true;
 }
